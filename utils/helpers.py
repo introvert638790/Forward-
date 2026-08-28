@@ -5,8 +5,11 @@ from datetime import datetime, timezone, timedelta
 from aiogram import Bot
 from aiogram.types import Message
 
-from database import col_config, col_state, col_settings, col_users
-from models.config_model import BotConfig, ForwardingState, BotSettings, UserProfile
+import secrets
+import re
+
+from database import col_config, col_state, col_settings, col_users, col_sessions
+from models.config_model import BotConfig, ForwardingState, BotSettings, UserProfile, SetupSession
 from config import config
 
 logger = logging.getLogger(__name__)
@@ -360,3 +363,190 @@ async def build_status_text(user_id: int) -> str:
     delay_line = f"⏱ <b>Delay:</b> {settings.delay_seconds}s per message"
 
     return "\n".join([source_line, dest_line, fwd_status, delay_line])
+
+
+# ─── SetupSession helpers (anonymous-admin destination token bridge) ─────────
+# Only used by the "Anonymous Admin Setup" path. Normal/Visible Setup keeps
+# using set_topic_capture_mode()/is_topic_capture_active() above, unchanged.
+
+_TOKEN_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # excludes 0/O/1/I/L
+_TOKEN_LENGTH = 8
+
+
+def generate_token() -> str:
+    """Cryptographically secure 8-char token. Repeated characters allowed."""
+    return "".join(secrets.choice(_TOKEN_ALPHABET) for _ in range(_TOKEN_LENGTH))
+
+
+async def create_session(user_id: int, mode: str, purpose: str = "destination") -> SetupSession:
+    """
+    Create a new setup session for the Anonymous Admin Setup flow.
+    purpose: "destination" | "source" — kept isolated via explicit filtering
+    in redeem_session, so a token created for one purpose can never resolve
+    a request for the other.
+    mode: "topic" | "normal_group"
+    Does NOT invalidate other still-valid tokens the same user may hold.
+    """
+    now = datetime.now(timezone.utc)
+    token = generate_token()
+    session = SetupSession(
+        token=token,
+        user_id=user_id,
+        purpose=purpose,
+        mode=mode,
+        created_at=now,
+        expires_at=now + timedelta(seconds=config.TOPIC_CAPTURE_EXPIRY),
+        used=False,
+        pending=False,
+    )
+    await col_sessions().insert_one(session.to_dict())
+    return session
+
+
+async def redeem_session(
+    token: str,
+    mode: str,
+    resolved_chat_id: int,
+    resolved_title: Optional[str],
+    resolved_thread_id: Optional[int],
+    resolved_type: str,
+    purpose: str = "destination",
+) -> Optional[SetupSession]:
+    """
+    Atomically redeem a token: only succeeds once, only before expiry, only
+    for the matching purpose (a "source" token can never satisfy a
+    destination redemption and vice versa — this is checked in the same
+    atomic filter, not after the fact), and only if the token's mode
+    matches (a "topic" token cannot configure a normal_group destination
+    and vice versa). On success the session moves into pending state,
+    awaiting the owner's Confirm/Cancel in their private chat — nothing is
+    saved to bot_config yet.
+
+    Returns the updated session on success, or None if the token is
+    invalid, expired, already used, wrong-purpose, or mode-mismatched —
+    callers must use one generic rejection message for all of these to
+    avoid leaking which condition failed.
+    """
+    now = datetime.now(timezone.utc)
+    doc = await col_sessions().find_one_and_update(
+        {
+            "_id": token,
+            "used": False,
+            "expires_at": {"$gt": now},
+            "purpose": purpose,
+            "mode": mode,
+        },
+        {"$set": {
+            "used": True,
+            "pending": True,
+            "resolved_chat_id": resolved_chat_id,
+            "resolved_title": resolved_title,
+            "resolved_thread_id": resolved_thread_id,
+            "resolved_type": resolved_type,
+        }},
+        return_document=True,
+    )
+    if doc is None:
+        return None
+    return SetupSession.from_dict(doc)
+
+
+async def get_pending_session(token: str) -> Optional[SetupSession]:
+    """Fetch a redeemed-but-not-yet-confirmed session, for the Confirm/Cancel callbacks."""
+    doc = await col_sessions().find_one({"_id": token, "pending": True})
+    if doc is None:
+        return None
+    return SetupSession.from_dict(doc)
+
+
+async def finalize_session(token: str) -> Optional[SetupSession]:
+    """
+    Atomically close out a pending session on Confirm (or Cancel — caller
+    decides whether to act on the result). Idempotent: a second call (e.g.
+    a double-tap on Confirm) finds pending already False and returns None,
+    so the caller can safely no-op instead of saving twice.
+    Still respects the original expires_at — no new timer is started for
+    the confirmation step itself.
+    """
+    now = datetime.now(timezone.utc)
+    doc = await col_sessions().find_one_and_update(
+        {"_id": token, "pending": True, "expires_at": {"$gt": now}},
+        {"$set": {"pending": False}},
+        return_document=True,
+    )
+    if doc is None:
+        return None
+    return SetupSession.from_dict(doc)
+
+
+# ─── Normal Group source: message link parsing + admin verification ──────────
+# Only used by the Normal Group source feature. Channel source/range stay
+# entirely forward-based (extract_forwarded_* above), untouched by this.
+
+# Matches:
+#   https://t.me/<public_username>/<message_id>
+#   https://t.me/c/<internal_chat_id>/<message_id>
+# Deliberately does NOT match 3-segment forum/topic-style links
+# (https://t.me/<username_or_c/id>/<thread_id>/<message_id>) — those are
+# out of scope for this feature and get a specific rejection message.
+_GROUP_LINK_RE = re.compile(
+    r"^https?://t\.me/(?:c/(\d+)|([a-zA-Z][\w]{4,31}))/(\d+)/?$"
+)
+_TOPIC_LINK_RE = re.compile(
+    r"^https?://t\.me/(?:c/\d+|[a-zA-Z][\w]{4,31})/\d+/\d+/?$"
+)
+
+
+def is_topic_style_link(text: str) -> bool:
+    """True if the text looks like a 3-segment forum/topic message link."""
+    return bool(_TOPIC_LINK_RE.match((text or "").strip()))
+
+
+def parse_group_message_link(text: str) -> Optional[tuple]:
+    """
+    Parse a Normal Group message link into (chat_id, message_id).
+    For private links (t.me/c/<internal_id>/<msg>), chat_id is returned as
+    the full -100-prefixed form Bot API expects.
+    For public links (t.me/<username>/<msg>), chat_id is returned as the
+    "@username" string — the caller must resolve it via bot.get_chat()
+    before use, since Bot API needs a numeric chat_id or "@username" for
+    lookups, not the bare username.
+    Returns None if the text isn't a recognizable 2-segment group link.
+    """
+    text = (text or "").strip()
+    m = _GROUP_LINK_RE.match(text)
+    if not m:
+        return None
+    internal_id, username, message_id = m.groups()
+    if internal_id:
+        chat_id = int(f"-100{internal_id}")
+        return chat_id, int(message_id)
+    return f"@{username}", int(message_id)
+
+
+async def resolve_group_chat_id(bot: Bot, chat_ref) -> Optional[int]:
+    """
+    Turn a chat_id or "@username" reference into a confirmed numeric
+    chat_id, verifying the bot can actually see this chat (i.e. is at
+    least a member — required for get_chat to succeed at all).
+    """
+    try:
+        chat = await bot.get_chat(chat_ref)
+        return chat.id
+    except Exception as e:
+        logger.warning("resolve_group_chat_id failed for %s: %s", chat_ref, e)
+        return None
+
+
+async def bot_is_admin_in_chat(bot: Bot, chat_id: int) -> bool:
+    """
+    Verify the bot has admin status in the given chat. Used at Normal Group
+    source setup time (not only discovered later when forwarding fails).
+    """
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id, me.id)
+        return member.status in ("administrator", "creator")
+    except Exception as e:
+        logger.warning("bot_is_admin_in_chat failed for chat_id=%s: %s", chat_id, e)
+        return False

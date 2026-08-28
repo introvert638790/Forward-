@@ -1,7 +1,7 @@
 import logging
-from aiogram import Router, Bot
+from aiogram import Router, Bot, F
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery
 from aiogram.enums import ChatType
 
 from utils.auth import is_allowed_or_owner
@@ -10,114 +10,357 @@ from utils.helpers import (
     set_topic_capture_mode,
     load_config,
     save_config,
+    redeem_session,
+    get_pending_session,
+    bot_is_admin_in_chat,
 )
 from models.config_model import BotConfig
+from keyboards.main_menu import destination_confirm_keyboard, source_confirm_keyboard
 
 logger = logging.getLogger(__name__)
 router = Router()
 
 
+_NOT_STARTED_VISIBLE = (
+    "⚠️ Destination setup has not been started.\n\n"
+    "Open the bot's private chat → Set Destination and choose the appropriate "
+    "Normal / Visible Setup.\n"
+    "Then return here and send /setdestination."
+)
+
+_NOT_STARTED_ANON = (
+    "⚠️ Destination setup has not been started.\n\n"
+    "Open the bot's private chat → Set Destination and choose Anonymous Admin Setup.\n"
+    "Then return here and send the generated setup command."
+)
+
+_TOKEN_INVALID = (
+    "⚠️ This setup command is invalid or has expired.\n"
+    "Generate a new one from Set Destination in the bot's private chat."
+)
+
+_SRC_NOT_STARTED_VISIBLE = (
+    "⚠️ Source setup has not been started.\n\n"
+    "Open the bot's private chat → Set Source → Normal Group → "
+    "Normal / Visible Setup.\n"
+    "Then return here and send /setsource."
+)
+
+_SRC_NOT_STARTED_ANON = (
+    "⚠️ Source setup has not been started.\n\n"
+    "Open the bot's private chat → Set Source → Normal Group → "
+    "Anonymous Admin Setup.\n"
+    "Then return here and send the generated setup command."
+)
+
+_SRC_TOKEN_INVALID = (
+    "⚠️ This setup command is invalid or has expired.\n"
+    "Generate a new one from Set Source in the bot's private chat."
+)
+
+_SRC_NOT_ADMIN = (
+    "⚠️ The bot is not an admin in this group yet.\n\n"
+    "Please make the bot an admin here, then send the setup command again."
+)
+
+
+def _resolve_destination(message: Message) -> tuple[int, str, int | None, str]:
+    """
+    Detect destination type/thread from the current message's chat, without
+    saving anything. Returns (chat_id, chat_title, thread_id, destination_type).
+    destination_type: "normal_group" | "forum_topic" | "forum_general"
+    """
+    chat_id = message.chat.id
+    chat_title = message.chat.title or str(chat_id)
+    is_forum = getattr(message.chat, "is_forum", False)
+
+    if not is_forum:
+        return chat_id, chat_title, None, "normal_group"
+
+    thread_id = message.message_thread_id
+    # Minimal, targeted debug log to verify General-topic payload shape on a
+    # real client before this condition is trusted long-term. Intentionally
+    # narrow — only fires for forum chats, not broad request logging.
+    logger.info(
+        "[dest-detect] forum chat_id=%s is_forum=%s message_thread_id=%s is_topic_message=%s",
+        chat_id, is_forum, thread_id, getattr(message, "is_topic_message", None),
+    )
+    if not thread_id:
+        return chat_id, chat_title, None, "forum_general"
+    return chat_id, chat_title, thread_id, "forum_topic"
+
+
 @router.message(Command("setdestination"))
 async def cmd_setdestination(message: Message, bot: Bot) -> None:
     """
-    Handles /setdestination sent inside a forum topic or normal group.
-    Requires topic capture mode to be armed via /arm_topic_mode in private chat.
+    Handles /setdestination sent inside a forum topic, General topic, or
+    normal group. Two independent paths:
 
-    Change from private bot:
-    - Uses is_allowed_or_owner() instead of owner_required()
-    - Passes user_id to all config/settings DB operations
+    - Visible sender: unchanged existing behavior — requires the
+      Normal/Visible Setup capture flag armed via private chat, keyed on the
+      sender's real user_id. No token involved, session collection is never
+      queried on this path.
+    - Anonymous admin sender (sender_chat == this chat): the real user_id is
+      not available from Telegram, so a setup token generated in private
+      chat is required. Redeeming it is atomic and does NOT save the
+      destination immediately — it lands in "pending" state and a
+      confirmation prompt is sent to the token owner's private chat only.
     """
     if not await is_allowed_or_owner(message):
         return
 
-    user_id = message.from_user.id
-
-    # Must be in a group or supergroup
     chat_type = message.chat.type
     if chat_type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await message.reply(
-            "⚠️ This command must be sent inside a group or supergroup, not in private chat.\n"
-            "Use /arm_topic_mode in private chat first, then send /setdestination in your group/topic."
+            "⚠️ This command must be sent inside a group or supergroup, not in private chat."
         )
         return
 
-    # Topic capture mode must be armed for this user
-    if not await is_topic_capture_active(user_id):
+    is_anonymous = message.sender_chat is not None and message.sender_chat.id == message.chat.id
+
+    # Parse optional token argument, e.g. "/setdestination H7K9P2MX"
+    parts = (message.text or "").split(maxsplit=1)
+    token = parts[1].strip() if len(parts) > 1 else None
+
+    if not is_anonymous:
+        # ── Visible sender: existing user_id-based workflow, unchanged ──
+        user_id = message.from_user.id
+
+        if token:
+            # Visible users never need a token — reject politely without
+            # touching the sessions collection at all.
+            await message.reply(
+                "ℹ️ You're using Normal / Visible Setup.\n"
+                "Please send /setdestination without a code."
+            )
+            return
+
+        if not await is_topic_capture_active(user_id):
+            await message.reply(_NOT_STARTED_VISIBLE)
+            return
+
+        chat_id, chat_title, thread_id, dest_type = _resolve_destination(message)
+
+        cfg = await load_config(user_id)
+        cfg.user_id = user_id
+        cfg.destination_chat_id = chat_id
+        cfg.destination_title = chat_title
+        cfg.destination_type = dest_type
+        cfg.destination_thread_id = thread_id
+        await save_config(cfg)
+
+        await set_topic_capture_mode(user_id, False)
+        await message.reply(_success_text(dest_type, chat_title, chat_id, thread_id), parse_mode="HTML")
+        logger.info(
+            "[user=%s] Destination set via visible setup: type=%s chat_id=%s thread_id=%s",
+            user_id, dest_type, chat_id, thread_id,
+        )
+        return
+
+    # ── Anonymous admin sender: token-bridge workflow ──
+    if not token:
+        await message.reply(_NOT_STARTED_ANON)
+        return
+
+    chat_id, chat_title, thread_id, dest_type = _resolve_destination(message)
+    session_mode = "topic" if dest_type in ("forum_topic", "forum_general") else "normal_group"
+
+    session = await redeem_session(
+        token=token,
+        mode=session_mode,
+        resolved_chat_id=chat_id,
+        resolved_title=chat_title,
+        resolved_thread_id=thread_id,
+        resolved_type=dest_type,
+        purpose="destination",
+    )
+    if session is None:
+        # Covers: unknown token, expired, already used, and mode mismatch —
+        # deliberately one generic message for all of these so a wrong
+        # guess can't be used to probe which condition failed.
+        await message.reply(_TOKEN_INVALID)
+        return
+
+    # Do NOT save yet — confirmation goes to the token owner's private chat only.
+    try:
+        if dest_type == "forum_general":
+            detail = "📌 Topic: General\n"
+        elif dest_type == "forum_topic":
+            detail = f"📌 Thread ID: <code>{thread_id}</code>\n"
+        else:
+            detail = ""
+        await bot.send_message(
+            chat_id=session.user_id,
+            text=(
+                "🔗 <b>Destination detected</b>\n\n"
+                f"🏷 Group: <b>{chat_title}</b>\n"
+                f"{detail}\n"
+                "Is this your destination?"
+            ),
+            reply_markup=destination_confirm_keyboard(token),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning("Could not deliver destination confirmation to user %s: %s", session.user_id, e)
         await message.reply(
-            "⚠️ Topic capture mode is not active.\n\n"
-            "Go to bot private chat and run /arm_topic_mode first, "
-            "then come back and send /setdestination here."
+            "⚠️ Couldn't reach your private chat to confirm this destination. "
+            "Please open the bot's private chat first, then try the setup command again."
+        )
+        return
+
+    # Neutral acknowledgement in the group — no destination/identity details exposed here.
+    await message.reply("✅ Setup command received. Please confirm in the bot's private chat.")
+    logger.info(
+        "[token=%s] Anonymous destination redeemed, pending confirmation: chat_id=%s thread_id=%s type=%s",
+        token, chat_id, thread_id, dest_type,
+    )
+
+
+@router.message(Command("setsource"))
+async def cmd_setsource(message: Message, bot: Bot) -> None:
+    """
+    Handles /setsource sent inside a Normal Group (forum/topic groups are
+    out of scope for source setup). Mirrors cmd_setdestination's structure
+    exactly:
+
+    - Visible sender: existing user_id-based capture-mode flow, keyed on
+      the sender's real user_id. No token, session collection untouched.
+    - Anonymous admin sender: requires a setup token generated in private
+      chat (purpose="source", mode="normal_group"). Redeeming it does NOT
+      save the source immediately — confirmation goes to the token
+      owner's private chat only, same as destination.
+
+    Bot admin status is verified here, at setup time, not only discovered
+    later when forwarding fails.
+    """
+    if not await is_allowed_or_owner(message):
+        return
+
+    chat_type = message.chat.type
+    if chat_type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.reply(
+            "⚠️ This command must be sent inside a group or supergroup, not in private chat."
         )
         return
 
     chat_id = message.chat.id
     chat_title = message.chat.title or str(chat_id)
-    thread_id = message.message_thread_id
-    is_forum = getattr(message.chat, "is_forum", False)
 
-    if is_forum:
-        # Forum topic supergroup
-        if not thread_id:
+    if not await bot_is_admin_in_chat(bot, chat_id):
+        await message.reply(_SRC_NOT_ADMIN)
+        return
+
+    is_anonymous = message.sender_chat is not None and message.sender_chat.id == message.chat.id
+
+    # Parse optional token argument, e.g. "/setsource H7K9P2MX"
+    parts = (message.text or "").split(maxsplit=1)
+    token = parts[1].strip() if len(parts) > 1 else None
+
+    if not is_anonymous:
+        # ── Visible sender: existing user_id-based workflow, unchanged pattern ──
+        user_id = message.from_user.id
+
+        if token:
             await message.reply(
-                "⚠️ Could not detect a topic thread ID.\n\n"
-                "Make sure you are sending this command <b>inside a specific topic</b>, "
-                "not in the General area of the forum.\n"
-                "Please navigate into a named topic and try again.",
-                parse_mode="HTML",
+                "ℹ️ You're using Normal / Visible Setup.\n"
+                "Please send /setsource without a code."
             )
             return
 
-        # Verify via getChat
-        try:
-            chat_info = await bot.get_chat(chat_id)
-            verified_forum = getattr(chat_info, "is_forum", False)
-            if not verified_forum:
-                await message.reply(
-                    "⚠️ This supergroup does not have forum topics enabled.\n"
-                    "Please enable Topics in group settings first."
-                )
-                return
-        except Exception as e:
-            logger.warning(f"Could not verify chat forum status: {e}")
+        if not await is_topic_capture_active(user_id):
+            await message.reply(_SRC_NOT_STARTED_VISIBLE)
+            return
 
         cfg = await load_config(user_id)
         cfg.user_id = user_id
-        cfg.destination_chat_id = chat_id
-        cfg.destination_title = chat_title
-        cfg.destination_type = "forum_topic"
-        cfg.destination_thread_id = thread_id
+        cfg.source_chat_id = chat_id
+        cfg.source_title = chat_title
+        cfg.source_type = "normal_group"
         await save_config(cfg)
 
         await set_topic_capture_mode(user_id, False)
+        await message.reply(_source_success_text(chat_title, chat_id), parse_mode="HTML")
+        logger.info(
+            "[user=%s] Source group set via visible setup: chat_id=%s", user_id, chat_id
+        )
+        return
 
+    # ── Anonymous admin sender: token-bridge workflow, purpose="source" ──
+    if not token:
+        await message.reply(_SRC_NOT_STARTED_ANON)
+        return
+
+    session = await redeem_session(
+        token=token,
+        mode="normal_group",
+        resolved_chat_id=chat_id,
+        resolved_title=chat_title,
+        resolved_thread_id=None,
+        resolved_type="normal_group",
+        purpose="source",
+    )
+    if session is None:
+        # Covers unknown/expired/used/wrong-purpose/wrong-mode tokens — one
+        # generic message, no leaking which condition failed.
+        await message.reply(_SRC_TOKEN_INVALID)
+        return
+
+    # Do NOT save yet — confirmation goes to the token owner's private chat only.
+    try:
+        await bot.send_message(
+            chat_id=session.user_id,
+            text=(
+                "🔗 <b>Source detected</b>\n\n"
+                f"🏷 Group: <b>{chat_title}</b>\n\n"
+                "Is this your source?"
+            ),
+            reply_markup=source_confirm_keyboard(token),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning("Could not deliver source confirmation to user %s: %s", session.user_id, e)
         await message.reply(
-            f"✅ <b>Destination topic saved!</b>\n\n"
+            "⚠️ Couldn't reach your private chat to confirm this source. "
+            "Please open the bot's private chat first, then try the setup command again."
+        )
+        return
+
+    await message.reply("✅ Setup command received. Please confirm in the bot's private chat.")
+    logger.info(
+        "[token=%s] Anonymous source redeemed, pending confirmation: chat_id=%s", token, chat_id,
+    )
+
+
+def _source_success_text(chat_title: str, chat_id: int) -> str:
+    return (
+        "✅ <b>Source group saved!</b>\n\n"
+        f"🏷 Group: <b>{chat_title}</b>\n"
+        f"🆔 Group ID: <code>{chat_id}</code>\n\n"
+        "Next, use Range Forward in the bot's private chat — for a Normal "
+        "Group source you'll be asked for message links instead of forwards."
+    )
+
+
+def _success_text(dest_type: str, chat_title: str, chat_id: int, thread_id: int | None) -> str:
+    if dest_type == "forum_general":
+        return (
+            "✅ <b>Destination General topic saved!</b>\n\n"
+            f"🏷 Group: <b>{chat_title}</b>\n"
+            f"🆔 Group ID: <code>{chat_id}</code>\n"
+            "📌 Topic: General\n\n"
+            "You can now use Range Forward in the bot's private chat."
+        )
+    if dest_type == "forum_topic":
+        return (
+            "✅ <b>Destination topic saved!</b>\n\n"
             f"🏷 Group: <b>{chat_title}</b>\n"
             f"🆔 Group ID: <code>{chat_id}</code>\n"
             f"📌 Thread ID: <code>{thread_id}</code>\n\n"
-            f"You can now use /range in private chat to start forwarding.",
-            parse_mode="HTML",
+            "You can now use Range Forward in the bot's private chat."
         )
-        logger.info(f"[user={user_id}] Destination forum topic set: chat_id={chat_id}, thread_id={thread_id}")
-
-    else:
-        # Normal group
-        cfg = await load_config(user_id)
-        cfg.user_id = user_id
-        cfg.destination_chat_id = chat_id
-        cfg.destination_title = chat_title
-        cfg.destination_type = "normal_group"
-        cfg.destination_thread_id = None
-        await save_config(cfg)
-
-        await set_topic_capture_mode(user_id, False)
-
-        await message.reply(
-            f"✅ <b>Destination group saved!</b>\n\n"
-            f"🏷 Group: <b>{chat_title}</b>\n"
-            f"🆔 Group ID: <code>{chat_id}</code>\n"
-            f"📋 Type: Normal group\n\n"
-            f"You can now use /range in private chat to start forwarding.",
-            parse_mode="HTML",
-        )
-        logger.info(f"[user={user_id}] Destination normal group set: chat_id={chat_id}")
+    return (
+        "✅ <b>Destination group saved!</b>\n\n"
+        f"🏷 Group: <b>{chat_title}</b>\n"
+        f"🆔 Group ID: <code>{chat_id}</code>\n\n"
+        "You can now use Range Forward in the bot's private chat."
+    )

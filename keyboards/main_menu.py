@@ -11,11 +11,10 @@ def main_menu_keyboard(is_owner: bool = False) -> InlineKeyboardMarkup:
     """
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(text="📢 Set Source", callback_data="menu_setsource"),
+        InlineKeyboardButton(text="📢 Set Source", callback_data="menu_set_source"),
     )
     builder.row(
-        InlineKeyboardButton(text="📌 Arm Topic Mode", callback_data="menu_arm_topic"),
-        InlineKeyboardButton(text="👥 Set Normal Group", callback_data="menu_set_normal_group"),
+        InlineKeyboardButton(text="📍 Set Destination", callback_data="menu_set_destination"),
     )
     builder.row(
         InlineKeyboardButton(text="▶️ Range Forward", callback_data="menu_range"),
@@ -117,6 +116,93 @@ def cancel_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_flow"),
+    )
+    return builder.as_markup()
+
+
+def source_type_keyboard() -> InlineKeyboardMarkup:
+    """Set Source submenu: choose Channel / Normal Group."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="📢 Channel", callback_data="src_type_channel"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="👥 Normal Group", callback_data="src_type_normal"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🔙 Back to Menu", callback_data="menu_back"),
+    )
+    return builder.as_markup()
+
+
+def source_mode_keyboard() -> InlineKeyboardMarkup:
+    """Normal/Visible vs Anonymous Admin Setup chooser for Normal Group source."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="👤 Normal / Visible Setup", callback_data="src_visible_normal_group"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🕵️ Anonymous Admin Setup", callback_data="src_anon_normal_group"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🔙 Back", callback_data="menu_set_source"),
+    )
+    return builder.as_markup()
+
+
+def source_confirm_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Shown in the token owner's private chat after a source group is detected."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✅ Confirm", callback_data=f"src_confirm_{token}"),
+        InlineKeyboardButton(text="❌ Cancel", callback_data=f"src_cancel_{token}"),
+    )
+    return builder.as_markup()
+
+
+def destination_type_keyboard() -> InlineKeyboardMarkup:
+    """Set Destination submenu: choose Channel / Topic Wise Group / Normal Group."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="📢 Channel", callback_data="dest_type_channel"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="💬 Topic Wise Group", callback_data="dest_type_topic"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="👥 Normal Group", callback_data="dest_type_normal"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🔙 Back to Menu", callback_data="menu_back"),
+    )
+    return builder.as_markup()
+
+
+def destination_mode_keyboard(mode: str) -> InlineKeyboardMarkup:
+    """
+    Normal/Visible vs Anonymous Admin Setup chooser.
+    mode: "topic" | "normal_group" — encoded into callback_data so the next
+    handler knows which destination type this choice applies to.
+    """
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="👤 Normal / Visible Setup", callback_data=f"dest_visible_{mode}"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🕵️ Anonymous Admin Setup", callback_data=f"dest_anon_{mode}"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🔙 Back", callback_data="menu_set_destination"),
+    )
+    return builder.as_markup()
+
+
+def destination_confirm_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Shown in the token owner's private chat after a destination is detected."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✅ Confirm", callback_data=f"dest_confirm_{token}"),
+        InlineKeyboardButton(text="❌ Cancel", callback_data=f"dest_cancel_{token}"),
     )
     return builder.as_markup()
 

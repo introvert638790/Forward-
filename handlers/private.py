@@ -15,11 +15,18 @@ from utils.helpers import (
     load_settings,
     save_settings,
     set_topic_capture_mode,
+    is_topic_capture_active,
     extract_forwarded_message_id,
     extract_forwarded_chat_id,
     extract_forwarded_chat_title,
     build_status_text,
     upsert_user_on_activity,
+    create_session,
+    finalize_session,
+    bot_is_admin_in_chat,
+    parse_group_message_link,
+    is_topic_style_link,
+    resolve_group_chat_id,
 )
 from models.config_model import BotConfig, ForwardingState, BotSettings
 from keyboards.main_menu import (
@@ -28,6 +35,11 @@ from keyboards.main_menu import (
     settings_keyboard,
     back_to_menu_keyboard,
     cancel_keyboard,
+    destination_type_keyboard,
+    destination_mode_keyboard,
+    source_type_keyboard,
+    source_mode_keyboard,
+    source_confirm_keyboard,
 )
 from services.task_manager import start_forwarding_task, stop_forwarding_task
 from config import config
@@ -42,6 +54,10 @@ class SetSourceStates(StatesGroup):
     waiting_for_forward = State()
 
 
+class SetDestinationChannelStates(StatesGroup):
+    waiting_for_forward = State()
+
+
 class RangeStates(StatesGroup):
     waiting_for_first = State()
     waiting_for_last = State()
@@ -50,6 +66,10 @@ class RangeStates(StatesGroup):
 
 class SetNormalGroupStates(StatesGroup):
     waiting_for_forward = State()
+
+
+class SetSourceNormalGroupStates(StatesGroup):
+    waiting_for_link = State()
 
 
 class SettingsStates(StatesGroup):
@@ -156,6 +176,7 @@ async def handle_source_forward(message: Message, state: FSMContext) -> None:
     cfg.user_id = user_id
     cfg.source_chat_id = chat_id
     cfg.source_title = chat_title or str(chat_id)
+    cfg.source_type = "channel"
     await save_config(cfg)
     await state.clear()
 
@@ -184,14 +205,14 @@ async def cmd_arm_topic_mode(message: Message, state: FSMContext) -> None:
     await state.clear()
     await set_topic_capture_mode(user_id, True)
     await message.answer(
-        "🎯 <b>Topic Capture Mode Enabled</b>\n\n"
-        "Now go to your destination supergroup, open the desired topic, and send:\n\n"
+        "👤 <b>Normal / Visible Setup armed</b>\n\n"
+        "Now go to your destination supergroup, open the desired topic (or General), and send:\n\n"
         "<code>/setdestination</code>\n\n"
-        "⏳ This mode expires in <b>10 minutes</b>.",
+        "⏳ Valid for <b>10 minutes</b>.",
         parse_mode="HTML",
         reply_markup=back_to_menu_keyboard(),
     )
-    logger.info(f"[user={user_id}] Topic capture mode armed.")
+    logger.info(f"[user={user_id}] Topic capture mode armed via /arm_topic_mode shortcut.")
 
 
 # ─── Set Normal Group ─────────────────────────────────────────────────────────
@@ -278,7 +299,7 @@ async def cmd_range(message: Message, state: FSMContext) -> None:
         if not cfg.is_source_configured():
             missing.append("source channel (use /setsource)")
         if not cfg.is_destination_configured():
-            missing.append("destination (use /arm_topic_mode + /setdestination)")
+            missing.append("destination (use Set Destination in the menu)")
         await message.answer(
             f"⚠️ Bot is not fully configured yet.\n\nMissing: {', '.join(missing)}",
             reply_markup=main_menu_keyboard(is_owner=_owner_flag(message)),
@@ -296,70 +317,154 @@ async def cmd_range(message: Message, state: FSMContext) -> None:
         return
 
     await state.set_state(RangeStates.waiting_for_first)
-    await message.answer(
-        "📨 <b>Range Forwarding Setup</b>\n\n"
-        "<b>Step 1 of 2:</b> Forward the <b>FIRST</b> message of your desired range "
-        "from the source channel to this chat.",
-        reply_markup=cancel_keyboard(),
-        parse_mode="HTML",
-    )
+    if cfg.source_type == "normal_group":
+        await message.answer(
+            "📨 <b>Range Forwarding Setup</b>\n\n"
+            "<b>Step 1 of 2:</b> Send the message <b>link</b> of the <b>FIRST</b> "
+            "message of your desired range from the source group.",
+            reply_markup=cancel_keyboard(),
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(
+            "📨 <b>Range Forwarding Setup</b>\n\n"
+            "<b>Step 1 of 2:</b> Forward the <b>FIRST</b> message of your desired range "
+            "from the source channel to this chat.",
+            reply_markup=cancel_keyboard(),
+            parse_mode="HTML",
+        )
 
 
 @router.message(RangeStates.waiting_for_first)
-async def handle_range_first(message: Message, state: FSMContext) -> None:
+async def handle_range_first(message: Message, state: FSMContext, bot: Bot) -> None:
     if not await allowed_or_owner_required(message):
         return
 
     user_id = message.from_user.id
-    msg_id = extract_forwarded_message_id(message)
-
-    if msg_id is None:
-        await message.answer(
-            "⚠️ Could not extract message ID.\n\n"
-            "Please forward a message <b>directly from the source channel</b>.",
-            reply_markup=cancel_keyboard(),
-            parse_mode="HTML",
-        )
-        return
-
-    src_chat_id = extract_forwarded_chat_id(message)
     cfg = await load_config(user_id)
-    if src_chat_id and src_chat_id != cfg.source_chat_id:
-        await message.answer(
-            f"⚠️ This message is from a different channel (<code>{src_chat_id}</code>).\n\n"
-            f"Please forward from the configured source: "
-            f"<b>{cfg.source_title}</b> (<code>{cfg.source_chat_id}</code>).",
-            reply_markup=cancel_keyboard(),
-            parse_mode="HTML",
-        )
-        return
+
+    if cfg.source_type == "normal_group":
+        text = (message.text or "").strip()
+        if is_topic_style_link(text):
+            await message.answer(
+                "⚠️ That looks like a forum/topic message link.\n\n"
+                "Topic links aren't supported for Normal Group source setup. "
+                "Please send a regular group message link instead.",
+                reply_markup=cancel_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+        parsed = parse_group_message_link(text)
+        if parsed is None:
+            await message.answer(
+                "⚠️ Could not parse that as a group message link.\n\n"
+                "Please send a link like <code>https://t.me/c/1234567890/123</code> "
+                "or <code>https://t.me/yourgroup/123</code>.",
+                reply_markup=cancel_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+        chat_ref, msg_id = parsed
+        chat_id = chat_ref if isinstance(chat_ref, int) else await resolve_group_chat_id(bot, chat_ref)
+        if chat_id is None or chat_id != cfg.source_chat_id:
+            await message.answer(
+                f"⚠️ This link is from a different group.\n\n"
+                f"Please send a link from the configured source: "
+                f"<b>{cfg.source_title}</b> (<code>{cfg.source_chat_id}</code>).",
+                reply_markup=cancel_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+    else:
+        msg_id = extract_forwarded_message_id(message)
+        if msg_id is None:
+            await message.answer(
+                "⚠️ Could not extract message ID.\n\n"
+                "Please forward a message <b>directly from the source channel</b>.",
+                reply_markup=cancel_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+        src_chat_id = extract_forwarded_chat_id(message)
+        if src_chat_id and src_chat_id != cfg.source_chat_id:
+            await message.answer(
+                f"⚠️ This message is from a different channel (<code>{src_chat_id}</code>).\n\n"
+                f"Please forward from the configured source: "
+                f"<b>{cfg.source_title}</b> (<code>{cfg.source_chat_id}</code>).",
+                reply_markup=cancel_keyboard(),
+                parse_mode="HTML",
+            )
+            return
 
     await state.update_data(first_id=msg_id)
     await state.set_state(RangeStates.waiting_for_last)
-    await message.answer(
-        f"✅ First message ID captured: <code>{msg_id}</code>\n\n"
-        f"<b>Step 2 of 2:</b> Now forward the <b>LAST</b> message of your desired range.",
-        reply_markup=cancel_keyboard(),
-        parse_mode="HTML",
-    )
+    if cfg.source_type == "normal_group":
+        await message.answer(
+            f"✅ First message ID captured: <code>{msg_id}</code>\n\n"
+            f"<b>Step 2 of 2:</b> Now send the message <b>link</b> of the <b>LAST</b> "
+            f"message of your desired range.",
+            reply_markup=cancel_keyboard(),
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(
+            f"✅ First message ID captured: <code>{msg_id}</code>\n\n"
+            f"<b>Step 2 of 2:</b> Now forward the <b>LAST</b> message of your desired range.",
+            reply_markup=cancel_keyboard(),
+            parse_mode="HTML",
+        )
 
 
 @router.message(RangeStates.waiting_for_last)
-async def handle_range_last(message: Message, state: FSMContext) -> None:
+async def handle_range_last(message: Message, state: FSMContext, bot: Bot) -> None:
     if not await allowed_or_owner_required(message):
         return
 
     user_id = message.from_user.id
-    msg_id = extract_forwarded_message_id(message)
+    cfg = await load_config(user_id)
 
-    if msg_id is None:
-        await message.answer(
-            "⚠️ Could not extract message ID.\n\n"
-            "Please forward a message <b>directly from the source channel</b>.",
-            reply_markup=cancel_keyboard(),
-            parse_mode="HTML",
-        )
-        return
+    if cfg.source_type == "normal_group":
+        text = (message.text or "").strip()
+        if is_topic_style_link(text):
+            await message.answer(
+                "⚠️ That looks like a forum/topic message link.\n\n"
+                "Topic links aren't supported for Normal Group source setup. "
+                "Please send a regular group message link instead.",
+                reply_markup=cancel_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+        parsed = parse_group_message_link(text)
+        if parsed is None:
+            await message.answer(
+                "⚠️ Could not parse that as a group message link.\n\n"
+                "Please send a link like <code>https://t.me/c/1234567890/123</code> "
+                "or <code>https://t.me/yourgroup/123</code>.",
+                reply_markup=cancel_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+        chat_ref, msg_id = parsed
+        chat_id = chat_ref if isinstance(chat_ref, int) else await resolve_group_chat_id(bot, chat_ref)
+        if chat_id is None or chat_id != cfg.source_chat_id:
+            await message.answer(
+                f"⚠️ This link is from a different group.\n\n"
+                f"Please send a link from the configured source: "
+                f"<b>{cfg.source_title}</b> (<code>{cfg.source_chat_id}</code>).",
+                reply_markup=cancel_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+    else:
+        msg_id = extract_forwarded_message_id(message)
+        if msg_id is None:
+            await message.answer(
+                "⚠️ Could not extract message ID.\n\n"
+                "Please forward a message <b>directly from the source channel</b>.",
+                reply_markup=cancel_keyboard(),
+                parse_mode="HTML",
+            )
+            return
 
     data = await state.get_data()
     first_id = data.get("first_id")
@@ -368,7 +473,7 @@ async def handle_range_last(message: Message, state: FSMContext) -> None:
         await message.answer(
             f"⚠️ Last message ID (<code>{msg_id}</code>) is before "
             f"first message ID (<code>{first_id}</code>).\n\n"
-            "Please forward a message that comes <b>after</b> the first one.",
+            "Please provide one that comes <b>after</b> the first one.",
             reply_markup=cancel_keyboard(),
             parse_mode="HTML",
         )
@@ -377,13 +482,12 @@ async def handle_range_last(message: Message, state: FSMContext) -> None:
     if msg_id == first_id:
         await message.answer(
             "⚠️ First and last message IDs are the same. "
-            "Please forward a different message as the last one.",
+            "Please provide a different message as the last one.",
             reply_markup=cancel_keyboard(),
             parse_mode="HTML",
         )
         return
 
-    cfg = await load_config(user_id)
     settings = await load_settings(user_id)
     total = msg_id - first_id + 1
 
@@ -533,6 +637,143 @@ async def cb_cancel_flow(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer("Cancelled.")
 
 
+@router.callback_query(F.data == "menu_set_source")
+async def cb_set_source(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user:
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "📢 <b>Set Source</b>\n\n"
+        "Choose your source type:",
+        reply_markup=source_type_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "src_type_channel")
+async def cb_src_type_channel(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user:
+        return
+    await state.set_state(SetSourceStates.waiting_for_forward)
+    await callback.message.edit_text(
+        "📢 <b>Set Source Channel</b>\n\n"
+        "Forward any message from your source channel to this chat.\n"
+        "The bot will extract the channel ID automatically.",
+        reply_markup=cancel_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "src_type_normal")
+async def cb_src_type_normal(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        "👥 <b>Normal Group Source</b>\n\n"
+        "For groups without forum topics enabled.\n\n"
+        "⚠️ The bot must be an <b>admin</b> in the source group.\n\n"
+        "• If your Telegram identity is visible in the group, use "
+        "<b>Normal / Visible Setup</b>.\n"
+        "• If you use Telegram's Remain Anonymous / Anonymous Admin mode, use "
+        "<b>Anonymous Admin Setup</b>.",
+        reply_markup=source_mode_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "src_visible_normal_group")
+async def cb_src_visible_normal_group(callback: CallbackQuery, state: FSMContext) -> None:
+    """Normal/Visible Setup for Normal Group source — no token, reuses capture-mode flag."""
+    if not callback.from_user:
+        return
+    user_id = callback.from_user.id
+    await state.clear()
+    await set_topic_capture_mode(user_id, True)
+    await callback.message.edit_text(
+        "👤 <b>Normal / Visible Setup — Normal Group Source</b>\n\n"
+        "Go to your source group and send:\n\n"
+        "<code>/setsource</code>\n\n"
+        "The bot must already be an admin there.\n\n"
+        "⏳ Valid for <b>10 minutes</b>.",
+        reply_markup=back_to_menu_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "src_anon_normal_group")
+async def cb_src_anon_normal_group(callback: CallbackQuery, state: FSMContext) -> None:
+    """Anonymous Admin Setup for Normal Group source — generates a one-time setup token."""
+    if not callback.from_user:
+        return
+    user_id = callback.from_user.id
+    await state.clear()
+    session = await create_session(user_id, mode="normal_group", purpose="source")
+    await callback.message.edit_text(
+        "🕵️ <b>Anonymous Admin Setup — Normal Group Source</b>\n\n"
+        "Go to your source group, with Remain Anonymous switched on, and send:\n\n"
+        f"<code>/setsource {session.token}</code>\n\n"
+        "Long-press the line above to copy the full command.\n\n"
+        "The bot must already be an admin there.\n\n"
+        "⏳ Valid for <b>10 minutes</b>.\n"
+        "⚠️ This command can be used only once.",
+        reply_markup=back_to_menu_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("src_confirm_"))
+async def cb_src_confirm(callback: CallbackQuery) -> None:
+    """Owner confirms a detected source group from the private-chat prompt."""
+    if not callback.from_user:
+        return
+    token = callback.data.removeprefix("src_confirm_")
+    session = await finalize_session(token)
+    if session is None:
+        await callback.answer("This request is no longer active.", show_alert=True)
+        return
+    if session.user_id != callback.from_user.id:
+        await callback.answer("This isn't your request.", show_alert=True)
+        return
+
+    cfg = await load_config(session.user_id)
+    cfg.user_id = session.user_id
+    cfg.source_chat_id = session.resolved_chat_id
+    cfg.source_title = session.resolved_title
+    cfg.source_type = "normal_group"
+    await save_config(cfg)
+
+    await callback.message.edit_text(
+        "✅ <b>Source group saved!</b>\n\n"
+        f"🏷 Group: <b>{session.resolved_title}</b>\n\n"
+        "Next, use Range Forward in the bot's private chat — for a Normal "
+        "Group source you'll be asked for message links instead of forwards.",
+        reply_markup=back_to_menu_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer("Source saved.")
+
+
+@router.callback_query(F.data.startswith("src_cancel_"))
+async def cb_src_cancel(callback: CallbackQuery) -> None:
+    """Owner cancels a detected source group — nothing is saved."""
+    if not callback.from_user:
+        return
+    token = callback.data.removeprefix("src_cancel_")
+    session = await finalize_session(token)
+    if session is None:
+        await callback.answer("This request is no longer active.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "❌ Source setup cancelled. Nothing was saved.",
+        reply_markup=back_to_menu_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer("Cancelled.")
+
+
 @router.callback_query(F.data == "menu_setsource")
 async def cb_setsource(callback: CallbackQuery, state: FSMContext) -> None:
     if not callback.from_user:
@@ -547,40 +788,235 @@ async def cb_setsource(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data == "menu_arm_topic")
-async def cb_arm_topic(callback: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(F.data == "menu_set_destination")
+async def cb_set_destination(callback: CallbackQuery, state: FSMContext) -> None:
     if not callback.from_user:
         return
-    user_id = callback.from_user.id
     await state.clear()
-    await set_topic_capture_mode(user_id, True)
     await callback.message.edit_text(
-        "🎯 <b>Topic Capture Mode Enabled</b>\n\n"
-        "Go to your destination supergroup, open the desired topic, and send:\n\n"
-        "<code>/setdestination</code>\n\n"
-        "⏳ This mode expires in <b>10 minutes</b>.",
+        "📍 <b>Set Destination</b>\n\n"
+        "Choose your destination type:",
+        reply_markup=destination_type_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "dest_type_channel")
+async def cb_dest_type_channel(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user:
+        return
+    await state.set_state(SetDestinationChannelStates.waiting_for_forward)
+    await callback.message.edit_text(
+        "📢 <b>Set Destination Channel</b>\n\n"
+        "Forward any message from your destination channel to this chat.\n"
+        "The bot will extract the channel info automatically.\n\n"
+        "⚠️ The bot must already be an <b>admin</b> in that channel with "
+        "permission to post messages.",
+        reply_markup=cancel_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(SetDestinationChannelStates.waiting_for_forward)
+async def handle_dest_channel_forward(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not await allowed_or_owner_required(message):
+        return
+
+    user_id = message.from_user.id
+    chat_id = extract_forwarded_chat_id(message)
+    chat_title = extract_forwarded_chat_title(message)
+
+    if chat_id is None:
+        await message.answer(
+            "⚠️ Could not extract channel info from this message.\n\n"
+            "Please forward a message <b>directly from the destination channel</b> "
+            "(not from a user or another bot).",
+            reply_markup=cancel_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+
+    if not await bot_is_admin_in_chat(bot, chat_id):
+        await message.answer(
+            "⚠️ The bot is not an admin in that channel yet.\n\n"
+            "Please make the bot an admin (with permission to post messages) "
+            "in the destination channel, then forward a message from it again.",
+            reply_markup=cancel_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+
+    cfg = await load_config(user_id)
+    cfg.user_id = user_id
+    cfg.destination_chat_id = chat_id
+    cfg.destination_title = chat_title
+    cfg.destination_type = "channel"
+    cfg.destination_thread_id = None
+    await save_config(cfg)
+
+    await state.clear()
+    await message.answer(
+        "✅ <b>Destination channel saved!</b>\n\n"
+        f"🏷 Channel: <b>{chat_title}</b>\n\n"
+        "You can now use Range Forward in the bot's private chat.",
         reply_markup=back_to_menu_keyboard(),
         parse_mode="HTML",
     )
-    await callback.answer("Topic capture mode armed.")
+    logger.info(f"[user={user_id}] Destination channel set: chat_id={chat_id}")
 
 
-@router.callback_query(F.data == "menu_set_normal_group")
-async def cb_set_normal_group(callback: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(F.data == "dest_type_topic")
+async def cb_dest_type_topic(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        "💬 <b>Topic Wise Group</b>\n\n"
+        "For groups with forum topics enabled. Open the specific topic before "
+        "sending <code>/setdestination</code> there — the General topic is "
+        "supported too.\n\n"
+        "• If your Telegram identity is visible in the group, use "
+        "<b>Normal / Visible Setup</b>.\n"
+        "• If you use Telegram's Remain Anonymous / Anonymous Admin mode, use "
+        "<b>Anonymous Admin Setup</b>.",
+        reply_markup=destination_mode_keyboard("topic"),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "dest_type_normal")
+async def cb_dest_type_normal(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        "👥 <b>Normal Group</b>\n\n"
+        "For groups without forum topics enabled.\n\n"
+        "• If your Telegram identity is visible in the group, use "
+        "<b>Normal / Visible Setup</b>.\n"
+        "• If you use Telegram's Remain Anonymous / Anonymous Admin mode, use "
+        "<b>Anonymous Admin Setup</b>.\n\n"
+        "Don't use Anonymous Admin Setup if your identity is visible — it isn't needed.",
+        reply_markup=destination_mode_keyboard("normal_group"),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("dest_visible_"))
+async def cb_dest_visible(callback: CallbackQuery, state: FSMContext) -> None:
+    """Normal/Visible Setup — no token, reuses the existing capture-mode flag."""
     if not callback.from_user:
         return
+    mode = callback.data.removeprefix("dest_visible_")  # "topic" | "normal_group"
     user_id = callback.from_user.id
     await state.clear()
     await set_topic_capture_mode(user_id, True)
+    if mode == "topic":
+        body = (
+            "👤 <b>Normal / Visible Setup — Topic Wise Group</b>\n\n"
+            "Go to your destination supergroup, open the desired topic (or General), and send:\n\n"
+            "<code>/setdestination</code>\n\n"
+            "⏳ Valid for <b>10 minutes</b>."
+        )
+    else:
+        body = (
+            "👤 <b>Normal / Visible Setup — Normal Group</b>\n\n"
+            "Go to your destination group and send:\n\n"
+            "<code>/setdestination</code>\n\n"
+            "⏳ Valid for <b>10 minutes</b>."
+        )
+    await callback.message.edit_text(body, reply_markup=back_to_menu_keyboard(), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("dest_anon_"))
+async def cb_dest_anon(callback: CallbackQuery, state: FSMContext) -> None:
+    """Anonymous Admin Setup — generates a one-time setup token."""
+    if not callback.from_user:
+        return
+    mode = callback.data.removeprefix("dest_anon_")  # "topic" | "normal_group"
+    user_id = callback.from_user.id
+    await state.clear()
+    session = await create_session(user_id, mode)
+    label = "Topic Wise Group" if mode == "topic" else "Normal Group"
+    where = (
+        "your destination supergroup, in the desired topic (or General)"
+        if mode == "topic" else "your destination group"
+    )
     await callback.message.edit_text(
-        "👥 <b>Set Normal Group Destination</b>\n\n"
-        "Go to your destination group and send:\n\n"
-        "<code>/setdestination</code>\n\n"
-        "⏳ This mode expires in <b>10 minutes</b>.",
+        f"🕵️ <b>Anonymous Admin Setup — {label}</b>\n\n"
+        f"Go to {where}, with Remain Anonymous switched on, and send:\n\n"
+        f"<code>/setdestination {session.token}</code>\n\n"
+        "Long-press the line above to copy the full command.\n\n"
+        "⏳ Valid for <b>10 minutes</b>.\n"
+        "⚠️ This command can be used only once.",
         reply_markup=back_to_menu_keyboard(),
         parse_mode="HTML",
     )
-    await callback.answer("Capture mode armed.")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("dest_confirm_"))
+async def cb_dest_confirm(callback: CallbackQuery) -> None:
+    """Owner confirms a detected destination from the private-chat prompt."""
+    if not callback.from_user:
+        return
+    token = callback.data.removeprefix("dest_confirm_")
+    session = await finalize_session(token)
+    if session is None:
+        # Already confirmed/cancelled/expired — idempotent no-op, no double save.
+        await callback.answer("This request is no longer active.", show_alert=True)
+        return
+    if session.user_id != callback.from_user.id:
+        # Defensive: confirmation is only ever sent to the owner's own chat,
+        # so this should be unreachable, but never let another user finalize it.
+        await callback.answer("This isn't your request.", show_alert=True)
+        return
+    cfg = await load_config(session.user_id)
+    cfg.destination_chat_id = session.resolved_chat_id
+    cfg.destination_title = session.resolved_title
+    cfg.destination_type = session.resolved_type
+    cfg.destination_thread_id = session.resolved_thread_id
+    await save_config(cfg)
+
+    if session.resolved_type == "forum_general":
+        text = (
+            "✅ <b>Destination General topic saved!</b>\n\n"
+            f"🏷 Group: <b>{session.resolved_title}</b>\n"
+            "📌 Topic: General\n\n"
+            "You can now use Range Forward in the bot's private chat."
+        )
+    elif session.resolved_type == "forum_topic":
+        text = (
+            "✅ <b>Destination topic saved!</b>\n\n"
+            f"🏷 Group: <b>{session.resolved_title}</b>\n"
+            f"📌 Thread ID: <code>{session.resolved_thread_id}</code>\n\n"
+            "You can now use Range Forward in the bot's private chat."
+        )
+    else:
+        text = (
+            "✅ <b>Destination group saved!</b>\n\n"
+            f"🏷 Group: <b>{session.resolved_title}</b>\n\n"
+            "You can now use Range Forward in the bot's private chat."
+        )
+    await callback.message.edit_text(text, reply_markup=back_to_menu_keyboard(), parse_mode="HTML")
+    await callback.answer("Destination saved.")
+
+
+@router.callback_query(F.data.startswith("dest_cancel_"))
+async def cb_dest_cancel(callback: CallbackQuery) -> None:
+    """Owner cancels a detected destination — nothing is saved."""
+    if not callback.from_user:
+        return
+    token = callback.data.removeprefix("dest_cancel_")
+    session = await finalize_session(token)
+    if session is None:
+        await callback.answer("This request is no longer active.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "❌ Destination setup cancelled. Nothing was saved.",
+        reply_markup=back_to_menu_keyboard(),
+        parse_mode="HTML",
+    )
+    await callback.answer("Cancelled.")
 
 
 @router.callback_query(F.data == "menu_range")
@@ -597,13 +1033,22 @@ async def cb_range(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("A forwarding task is already running. Stop it first.", show_alert=True)
         return
     await state.set_state(RangeStates.waiting_for_first)
-    await callback.message.edit_text(
-        "📨 <b>Range Forwarding Setup</b>\n\n"
-        "<b>Step 1 of 2:</b> Forward the <b>FIRST</b> message of your desired range "
-        "from the source channel to this chat.",
-        reply_markup=cancel_keyboard(),
-        parse_mode="HTML",
-    )
+    if cfg.source_type == "normal_group":
+        await callback.message.edit_text(
+            "📨 <b>Range Forwarding Setup</b>\n\n"
+            "<b>Step 1 of 2:</b> Send the message <b>link</b> of the <b>FIRST</b> "
+            "message of your desired range from the source group.",
+            reply_markup=cancel_keyboard(),
+            parse_mode="HTML",
+        )
+    else:
+        await callback.message.edit_text(
+            "📨 <b>Range Forwarding Setup</b>\n\n"
+            "<b>Step 1 of 2:</b> Forward the <b>FIRST</b> message of your desired range "
+            "from the source channel to this chat.",
+            reply_markup=cancel_keyboard(),
+            parse_mode="HTML",
+        )
     await callback.answer()
 
 

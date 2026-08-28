@@ -14,11 +14,14 @@ class BotConfig:
 
     source_chat_id: Optional[int] = None
     source_title: Optional[str] = None
+    # "channel" | "normal_group" — defaults to "channel" for backward
+    # compatibility with configs saved before this field existed.
+    source_type: Optional[str] = None
 
     destination_chat_id: Optional[int] = None
     destination_title: Optional[str] = None
 
-    # "forum_topic" or "normal_group"
+    # "forum_topic" | "normal_group" | "forum_general"
     destination_type: Optional[str] = None
 
     # Only set when destination_type == "forum_topic"
@@ -38,6 +41,7 @@ class BotConfig:
             "user_id": self.user_id,
             "source_chat_id": self.source_chat_id,
             "source_title": self.source_title,
+            "source_type": self.source_type,
             "destination_chat_id": self.destination_chat_id,
             "destination_title": self.destination_title,
             "destination_type": self.destination_type,
@@ -50,6 +54,7 @@ class BotConfig:
             user_id=d.get("user_id", 0),
             source_chat_id=d.get("source_chat_id"),
             source_title=d.get("source_title"),
+            source_type=d.get("source_type") or ("channel" if d.get("source_chat_id") else None),
             destination_chat_id=d.get("destination_chat_id"),
             destination_title=d.get("destination_title"),
             destination_type=d.get("destination_type"),
@@ -156,6 +161,77 @@ class BotSettings:
             delay_seconds=d.get("delay_seconds", 3.0),
             topic_capture_mode=d.get("topic_capture_mode", False),
             topic_capture_expires=d.get("topic_capture_expires"),
+        )
+
+
+# ─── NEW: SetupSession (anonymous-admin destination token bridge) ────────────
+
+@dataclass
+class SetupSession:
+    """
+    Stored in collection: setup_sessions
+    Keyed by the token itself (_id = token). Only used for the Anonymous
+    Admin Setup path — Normal/Visible Setup never creates one of these.
+
+    Lifecycle: created (pending=False, used=False)
+             -> redeemed (used=True, pending=True, resolved_* filled)
+             -> confirmed (pending=False, destination saved) or cancelled.
+
+    purpose values: "destination" | "source" — keeps the two token
+    families completely isolated from each other even though they share
+    one collection; redemption always filters on purpose explicitly, so
+    a source token can never resolve a destination request or vice versa.
+    mode values: "topic" | "normal_group" (meaning depends on purpose:
+    for purpose="source", mode is always "normal_group" since Channel
+    source setup never uses tokens).
+    """
+    token: str = ""
+    user_id: int = 0
+    purpose: str = "destination"
+    mode: str = "normal_group"
+
+    created_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+
+    used: bool = False                        # True once atomically redeemed
+    pending: bool = False                      # True while awaiting Confirm/Cancel
+
+    resolved_chat_id: Optional[int] = None
+    resolved_title: Optional[str] = None
+    resolved_thread_id: Optional[int] = None
+    resolved_type: Optional[str] = None        # "normal_group" | "forum_topic" | "forum_general"
+
+    def to_dict(self) -> dict:
+        return {
+            "_id": self.token,
+            "user_id": self.user_id,
+            "purpose": self.purpose,
+            "mode": self.mode,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "used": self.used,
+            "pending": self.pending,
+            "resolved_chat_id": self.resolved_chat_id,
+            "resolved_title": self.resolved_title,
+            "resolved_thread_id": self.resolved_thread_id,
+            "resolved_type": self.resolved_type,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SetupSession":
+        return cls(
+            token=d.get("_id", ""),
+            user_id=d.get("user_id", 0),
+            purpose=d.get("purpose", "destination"),
+            mode=d.get("mode", "normal_group"),
+            created_at=d.get("created_at"),
+            expires_at=d.get("expires_at"),
+            used=d.get("used", False),
+            pending=d.get("pending", False),
+            resolved_chat_id=d.get("resolved_chat_id"),
+            resolved_title=d.get("resolved_title"),
+            resolved_thread_id=d.get("resolved_thread_id"),
+            resolved_type=d.get("resolved_type"),
         )
 
 

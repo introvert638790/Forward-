@@ -16,6 +16,11 @@ async def connect_db() -> None:
         _db = _client[config.MONGO_DB_NAME]
         # Verify connection
         await _client.admin.command("ping")
+        # TTL index for anonymous-admin setup tokens: cleanup only.
+        # Real expiry authorization check happens explicitly in
+        # utils/helpers.redeem_session() — this index is NOT relied upon
+        # for auth correctness, only for eventually removing stale docs.
+        await _db["setup_sessions"].create_index("expires_at", expireAfterSeconds=0)
         logger.info("MongoDB connected successfully.")
     except Exception as e:
         logger.error(f"MongoDB connection failed: {e}")
@@ -60,3 +65,12 @@ def col_users():
     NEW in multi-user version.
     """
     return get_db()["users"]
+
+
+def col_sessions():
+    """
+    setup_sessions: temporary tokens bridging an anonymous-admin
+    /setdestination message back to the real private-chat user_id
+    that generated the token. TTL-indexed on expires_at for cleanup.
+    """
+    return get_db()["setup_sessions"]
